@@ -1,0 +1,1746 @@
+import React, { useState, useEffect, createContext, useContext } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut } from 'firebase/auth';
+import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, getDocs, serverTimestamp } from 'firebase/firestore';
+
+// --- Firebase Configuration and Initialization ---
+// Global variables provided by the Canvas environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Initialize Firebase App
+let firebaseApp;
+let db;
+let auth;
+
+try {
+  firebaseApp = initializeApp(firebaseConfig);
+  db = getFirestore(firebaseApp);
+  auth = getAuth(firebaseApp);
+} catch (e) {
+  console.error("Failed to initialize Firebase:", e);
+}
+
+// --- Contexts ---
+const AuthContext = createContext(null);
+const FirestoreContext = createContext(null);
+
+// --- Auth Provider Component ---
+function AuthProvider({ children }) {
+  const [currentUser, setCurrentUser] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [userRole, setUserRole] = useState(null);
+  const [loadingAuth, setLoadingAuth] = useState(true); // Track initial auth state
+
+  useEffect(() => {
+    if (!auth) {
+      console.error("Firebase Auth not initialized.");
+      setLoadingAuth(false);
+      return;
+    }
+
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        setCurrentUser(user);
+        setUserId(user.uid);
+        // Fetch user's role from Firestore
+        const userDocRef = doc(db, 'artifacts', appId, 'users', user.uid);
+        const userDocSnap = await getDoc(userDocRef);
+        if (userDocSnap.exists()) {
+          setUserRole(userDocSnap.data().role);
+        } else {
+          // New user, role will be set during Google sign-in based on selection
+          setUserRole(null);
+        }
+      } else {
+        setCurrentUser(null);
+        setUserId(null);
+        setUserRole(null);
+        // Sign in anonymously if no initial auth token, for public access.
+        // This is mainly for Canvas environment to provide a user ID for Firestore rules.
+        if (!initialAuthToken) {
+          try {
+            await signInAnonymously(auth);
+          } catch (error) {
+            console.error("Error signing in anonymously:", error);
+          }
+        }
+      }
+      setLoadingAuth(false);
+    });
+
+    // Attempt custom token sign-in if token is provided by Canvas
+    if (initialAuthToken && auth && !auth.currentUser) {
+      signInWithCustomToken(auth, initialAuthToken)
+        .catch((error) => {
+          console.error("Error signing in with custom token:", error);
+          // Fallback to anonymous if custom token fails
+          signInAnonymously(auth).catch(anonError => console.error("Anonymous sign-in failed:", anonError));
+        })
+        .finally(() => setLoadingAuth(false));
+    } else if (!initialAuthToken && auth && !auth.currentUser) {
+      // If no initial token, ensure anonymous sign-in or check state
+      signInAnonymously(auth).catch(anonError => console.error("Anonymous sign-in failed:", anonError));
+    }
+
+    return () => unsubscribe();
+  }, [initialAuthToken]);
+
+  const signInWithGoogle = async (role) => {
+    const provider = new GoogleAuthProvider();
+    try {
+      const result = await signInWithPopup(auth, provider);
+      const user = result.user;
+      // Store user info in Firestore, setting the chosen role
+      const userDocRef = doc(db, 'artifacts', appId, 'users', user.uid);
+      await setDoc(userDocRef, {
+        uid: user.uid,
+        email: user.email,
+        displayName: user.displayName,
+        photoURL: user.photoURL,
+        role: role, // Set the role based on the initial selection
+        createdAt: serverTimestamp(),
+      }, { merge: true });
+      setUserRole(role); // Update context state immediately
+    } catch (error) {
+      console.error("Error signing in with Google:", error);
+    }
+  };
+
+  const signOutUser = async () => {
+    try {
+      await signOut(auth);
+      setCurrentUser(null);
+      setUserId(null);
+      setUserRole(null); // Clear role on sign out
+      // Optionally, sign in anonymously again after full logout for Canvas
+      signInAnonymously(auth).catch(anonError => console.error("Anonymous sign-in failed after logout:", anonError));
+    } catch (error) {
+      console.error("Error signing out:", error);
+    }
+  };
+
+  return (
+    <AuthContext.Provider value={{ currentUser, userId, userRole, loadingAuth, signInWithGoogle, signOutUser, setUserRole }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+// --- Custom Hooks ---
+function useAuth() {
+  return useContext(AuthContext);
+}
+
+// --- Components ---
+
+// Universal Message Box (replaces alert/confirm)
+function MessageBox({ message, onClose }) {
+  if (!message) return null;
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+      <div className="bg-white rounded-lg shadow-xl p-6 max-w-sm w-full text-center">
+        <p className="text-gray-800 text-lg mb-4">{message}</p>
+        <button
+          onClick={onClose}
+          className="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded-lg transition duration-300"
+        >
+          OK
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// User Role Selection Screen
+function RoleSelection({ onSelectRole }) {
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-green-50 to-green-200 flex flex-col items-center justify-center p-4 font-inter">
+      <h1 className="text-5xl font-extrabold text-green-800 mb-8 drop-shadow-lg text-center">Rwanda Online Shopping</h1>
+      <p className="text-xl text-gray-700 mb-10 text-center max-w-2xl">Your premier destination for buying and selling locally!</p>
+
+      <div className="flex flex-col md:flex-row gap-8">
+        <button
+          onClick={() => onSelectRole('buyer')}
+          className="bg-green-600 hover:bg-green-700 text-white font-bold py-5 px-10 rounded-xl shadow-lg hover:shadow-xl transform hover:scale-105 transition duration-300 flex flex-col items-center justify-center text-2xl w-64 h-64 text-center"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-16 w-16 mb-4" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M7 21h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v12a2 2 0 002 2zM12 9a3 3 0 100 6 3 3 0 000-6zm0 2a1 1 0 110 2 1 1 0 010-2zm0 10c-3.31 0-6-2.69-6-6v-1c0-1.66 1.34-3 3-3h6c1.66 0 3 1.34 3 3v1c0 3.31-2.69 6-6 6z"/>
+          </svg>
+          I'm a Buyer
+        </button>
+        <button
+          onClick={() => onSelectRole('seller')}
+          className="bg-green-600 hover:bg-green-700 text-white font-bold py-5 px-10 rounded-xl shadow-lg hover:shadow-xl transform hover:scale-105 transition duration-300 flex flex-col items-center justify-center text-2xl w-64 h-64 text-center"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-16 w-16 mb-4" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 11c1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3 1.34 3 3 3zm5-5.34V4.66a1.5 1.5 0 011.5-1.5h.72a1.5 1.5 0 011.5 1.5v.72a1.5 1.5 0 01-1.5 1.5h-.72A1.5 1.5 0 0117 5.66zM15.4 12c-2.73 0-5.07 1.35-6.52 3.39-1.42 1.99-2.28 4.39-2.83 6.61H21c-.55-2.22-1.41-4.62-2.83-6.61C20.47 13.35 18.13 12 15.4 12zM11 20H4v-1.5c0-2.33 1.37-4.32 3.3-5.32C8.63 12.18 10.17 11.5 12 11.5c1.83 0 3.37.68 4.7 1.18-.32.12-.66.23-1 .33-.78.25-1.55.5-2.2.82C12.8 14.28 12.28 16.27 11.8 18c-.48 1.73-.7 3.53-.8 5H4v-1.5c0-2.33 1.37-4.32 3.3-5.32C8.63 12.18 10.17 11.5 12 11.5c1.83 0 3.37.68 4.7 1.18-.32.12-.66.23-1 .33-.78.25-1.55.5-2.2.82C12.8 14.28 12.28 16.27 11.8 18c-.48 1.73-.7 3.53-.8 5H4v-1.5c0-2.33 1.37-4.32 3.3-5.32C8.63 12.18 10.17 11.5 12 11.5c1.83 0 3.37.68 4.7 1.18-.32.12-.66.23-1 .33-.78.25-1.55.5-2.2.82C12.8 14.28 12.28 16.27 11.8 18c-.48 1.73-.7 3.53-.8 5H4v-1.5c0-2.33 1.37-4.32 3.3-5.32C8.63 12.18 10.17 11.5 12 11.5z"/>
+          </svg>
+          I'm a Seller
+        </button>
+        <button
+          onClick={() => onSelectRole('admin')}
+          className="bg-green-600 hover:bg-green-700 text-white font-bold py-5 px-10 rounded-xl shadow-lg hover:shadow-xl transform hover:scale-105 transition duration-300 flex flex-col items-center justify-center text-2xl w-64 h-64 text-center"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className="h-16 w-16 mb-4" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>
+          </svg>
+          I'm an Admin
+        </button>
+      </div>
+      <p className="text-gray-600 mt-8 text-center text-sm">
+        Contact: <a href="tel:+250798584225" className="text-green-700 hover:underline">250798584225</a> | Instagram: <a href="https://www.instagram.com/thierry.x_" target="_blank" rel="noopener noreferrer" className="text-green-700 hover:underline">thierry.x_</a>
+      </p>
+    </div>
+  );
+}
+
+// Product Card Component
+function ProductCard({ product, onAddToCart, showSellerInfo = false, onProductAction = null }) {
+  const [message, setMessage] = useState('');
+
+  const handleCopySellerInfo = () => {
+    const info = `Seller: ${product.sellerName || 'N/A'}\nPhone: ${product.sellerPhone || 'N/A'}`;
+    navigator.clipboard.writeText(info).then(() => {
+      setMessage('Seller info copied to clipboard!');
+    }).catch(err => {
+      setMessage('Failed to copy seller info.');
+      console.error('Copy failed:', err);
+    });
+  };
+
+  const isHouseOrCar = product.category === 'Houses' || product.category === 'Cars';
+
+  return (
+    <div className="bg-white rounded-xl shadow-lg overflow-hidden transition-all duration-300 hover:shadow-xl flex flex-col h-full">
+      <img
+        src={product.imageUrl || `https://placehold.co/400x300/e0ffe0/333333?text=${product.name || 'Product'}`}
+        alt={product.name}
+        className="w-full h-48 object-cover object-center rounded-t-xl"
+        onError={(e) => { e.target.onerror = null; e.target.src = `https://placehold.co/400x300/e0ffe0/333333?text=Image+Unavailable`; }}
+      />
+      <div className="p-4 flex-grow flex flex-col justify-between">
+        <div>
+          <h3 className="font-semibold text-xl text-gray-900 mb-2">{product.name}</h3>
+          <p className="text-green-700 text-lg font-bold mb-2">RWF {product.price.toLocaleString()}</p>
+          <p className="text-gray-600 text-sm mb-3 line-clamp-3">{product.description}</p>
+          <p className="text-gray-500 text-xs">Category: {product.category} {product.subCategory && `(${product.subCategory})`}</p>
+        </div>
+
+        {showSellerInfo && (
+          <div className="mt-3 border-t border-gray-200 pt-3">
+            <p className="text-gray-700 font-medium">Seller: {product.sellerName || 'N/A'}</p>
+            <p className="text-gray-700 font-medium">Phone: {product.sellerPhone || 'N/A'}</p>
+            <button
+              onClick={handleCopySellerInfo}
+              className="mt-2 bg-gray-200 hover:bg-gray-300 text-gray-800 text-sm py-1 px-3 rounded-full flex items-center justify-center transition duration-200"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
+              </svg>
+              Copy Info
+            </button>
+            <MessageBox message={message} onClose={() => setMessage('')} />
+          </div>
+        )}
+
+        <div className="mt-4">
+          {!isHouseOrCar ? (
+            <button
+              onClick={() => onAddToCart(product)}
+              className="w-full bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-lg shadow-md hover:shadow-lg transition duration-300"
+            >
+              Add to Cart
+            </button>
+          ) : (
+            <button
+              onClick={() => onProductAction(product)} // Action for contacting owner for house/car
+              className="w-full bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-lg shadow-md hover:shadow-lg transition duration-300"
+            >
+              Contact Owner
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Buyer Dashboard
+function BuyerDashboard({ currentUser, userId, signOutUser }) {
+  const [products, setProducts] = useState([]);
+  const [categories, setCategories] = useState([]);
+  const [subCategories, setSubCategories] = useState({});
+  const [selectedCategory, setSelectedCategory] = useState('All');
+  const [selectedSubCategory, setSelectedSubCategory] = useState('All');
+  const [message, setMessage] = useState('');
+  const [cart, setCart] = useState([]);
+  const [showCart, setShowCart] = useState(false);
+  const [deliveryAddress, setDeliveryAddress] = useState('');
+  const [buyerPaymentScreenshot, setBuyerPaymentScreenshot] = useState(null);
+  const [showCheckoutModal, setShowCheckoutModal] = useState(false);
+  const [currentSellerUssd, setCurrentSellerUssd] = useState('');
+  const [contactingProduct, setContactingProduct] = useState(null);
+  const [showContactModal, setShowContactModal] = useState(false);
+
+
+  const DELIVERY_FEE = 2000; // Fixed delivery fee in RWF
+
+  useEffect(() => {
+    if (!db) {
+      setMessage('Firestore not initialized. Cannot fetch products.');
+      return;
+    }
+
+    const productsRef = collection(db, 'artifacts', appId, 'public', 'data', 'products');
+    const q = query(productsRef, where('commissionPaid', '==', true)); // Only show products with paid commission
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const fetchedProducts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setProducts(fetchedProducts);
+
+      // Extract categories and sub-categories
+      const uniqueCategories = new Set();
+      const uniqueSubCategories = {};
+      fetchedProducts.forEach(p => {
+        uniqueCategories.add(p.category);
+        if (p.category && p.subCategory) {
+          if (!uniqueSubCategories[p.category]) {
+            uniqueSubCategories[p.category] = new Set();
+          }
+          uniqueSubCategories[p.category].add(p.subCategory);
+        }
+      });
+      setCategories(['All', ...Array.from(uniqueCategories)].sort());
+      const formattedSubCategories = {};
+      for (const cat in uniqueSubCategories) {
+        formattedSubCategories[cat] = ['All', ...Array.from(uniqueSubCategories[cat])].sort();
+      }
+      setSubCategories(formattedSubCategories);
+    }, (error) => {
+      console.error("Error fetching products:", error);
+      setMessage("Failed to load products.");
+    });
+
+    return () => unsubscribe();
+  }, [db]);
+
+  const handleAddToCart = (product) => {
+    setCart(prevCart => {
+      const existingItem = prevCart.find(item => item.id === product.id);
+      if (existingItem) {
+        return prevCart.map(item =>
+          item.id === product.id ? { ...item, quantity: item.quantity + 1 } : item
+        );
+      } else {
+        return [...prevCart, { ...product, quantity: 1 }];
+      }
+    });
+    setMessage(`${product.name} added to cart!`);
+  };
+
+  const updateCartQuantity = (id, quantity) => {
+    setCart(prevCart => {
+      if (quantity <= 0) {
+        return prevCart.filter(item => item.id !== id);
+      }
+      return prevCart.map(item =>
+        item.id === id ? { ...item, quantity: quantity } : item
+      );
+    });
+  };
+
+  const calculateTotal = () => {
+    const itemTotal = cart.reduce((sum, item) => sum + item.price * item.quantity, 0);
+    return itemTotal + DELIVERY_FEE;
+  };
+
+  const handleCheckout = async () => {
+    if (cart.length === 0) {
+      setMessage('Your cart is empty!');
+      return;
+    }
+    if (!deliveryAddress.trim()) {
+      setMessage('Please enter a delivery address.');
+      return;
+    }
+    if (!currentUser) {
+      setMessage('Please sign in to proceed with checkout.');
+      return;
+    }
+
+    // Get USSD code from the seller of the first item in cart (assuming one seller per order or mixed)
+    // For simplicity, let's just pick the first seller's USSD. In a real app,
+    // orders would be split by seller or a central payment gateway would be used.
+    const firstProductInCart = products.find(p => p.id === cart[0].id);
+    if (firstProductInCart && firstProductInCart.sellerId) {
+      const sellerDocRef = doc(db, 'artifacts', appId, 'users', firstProductInCart.sellerId);
+      const sellerDocSnap = await getDoc(sellerDocRef);
+      if (sellerDocSnap.exists() && sellerDocSnap.data().momoUssdCode) {
+        setCurrentSellerUssd(sellerDocSnap.data().momoUssdCode);
+        setShowCheckoutModal(true);
+      } else {
+        setMessage('Seller payment details not found for this product.');
+      }
+    } else {
+      setMessage('Could not find seller information for items in cart.');
+    }
+  };
+
+  const handlePlaceOrder = async () => {
+    if (!buyerPaymentScreenshot) {
+      setMessage('Please upload a screenshot of your MoMoPay payment.');
+      return;
+    }
+
+    try {
+      // Simulate order creation
+      for (const item of cart) {
+        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'orders'), {
+          buyerId: userId,
+          sellerId: item.sellerId, // Make sure product has sellerId
+          productId: item.id,
+          productName: item.name,
+          quantity: item.quantity,
+          itemPrice: item.price,
+          totalPrice: item.price * item.quantity + DELIVERY_FEE,
+          deliveryAddress: deliveryAddress,
+          buyerPaymentScreenshotUrl: URL.createObjectURL(buyerPaymentScreenshot), // In real app, upload to storage and get URL
+          buyerPaymentVerified: false,
+          status: 'Pending Seller Confirmation',
+          createdAt: serverTimestamp(),
+        });
+      }
+      setMessage('Order placed successfully! Waiting for seller/admin confirmation.');
+      setCart([]);
+      setDeliveryAddress('');
+      setBuyerPaymentScreenshot(null);
+      setShowCheckoutModal(false);
+      setShowCart(false); // Hide cart after checkout
+    } catch (error) {
+      console.error("Error placing order:", error);
+      setMessage('Failed to place order.');
+    }
+  };
+
+  const handleContactOwner = (product) => {
+    setContactingProduct(product);
+    setShowContactModal(true);
+  };
+
+  const filteredProducts = products.filter(product => {
+    const matchesCategory = selectedCategory === 'All' || product.category === selectedCategory;
+    const matchesSubCategory = selectedSubCategory === 'All' || product.subCategory === selectedSubCategory;
+    return matchesCategory && matchesSubCategory;
+  });
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-green-50 to-green-100 p-6 flex flex-col font-inter">
+      <header className="flex justify-between items-center pb-6 border-b border-green-200 mb-6">
+        <h1 className="text-4xl font-extrabold text-green-800 drop-shadow-sm">Shop</h1>
+        <div className="flex items-center space-x-4">
+          <span className="text-gray-700 text-sm">Hello, {currentUser?.displayName || 'Buyer'}! ({userId})</span>
+          <button
+            onClick={() => setShowCart(!showCart)}
+            className="relative bg-green-500 hover:bg-green-600 text-white p-3 rounded-full shadow-md transition duration-300"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M7 18c-1.1 0-1.99.9-1.99 2S5.9 22 7 22s2-.9 2-2-.9-2-2-2zm10 0c-1.1 0-1.99.9-1.99 2s.89 2 1.99 2 2-.9 2-2-.9-2-2-2zm-1.8-17L6 3H2v2h2.2l3.2 9h11.4l3.2-8H8.8L7.8 7h12.3l-1.6 4H7z"/>
+            </svg>
+            {cart.length > 0 && (
+              <span className="absolute -top-1 -right-1 bg-red-500 text-white text-xs font-bold rounded-full h-5 w-5 flex items-center justify-center">
+                {cart.length}
+              </span>
+            )}
+          </button>
+          <button
+            onClick={signOutUser}
+            className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-300"
+          >
+            Sign Out
+          </button>
+        </div>
+      </header>
+
+      {message && <MessageBox message={message} onClose={() => setMessage('')} />}
+
+      {showCart && (
+        <div className="fixed inset-0 bg-black bg-opacity-60 flex justify-end z-40">
+          <div className="bg-white w-full max-w-md h-full overflow-y-auto shadow-2xl rounded-l-xl p-6 flex flex-col">
+            <div className="flex justify-between items-center mb-6 border-b pb-4">
+              <h2 className="text-3xl font-bold text-gray-800">Your Cart</h2>
+              <button
+                onClick={() => setShowCart(false)}
+                className="text-gray-500 hover:text-gray-700 p-2 rounded-full hover:bg-gray-100 transition duration-200"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            {cart.length === 0 ? (
+              <p className="text-gray-500 text-center text-lg mt-10">Your cart is empty.</p>
+            ) : (
+              <>
+                <div className="flex-grow">
+                  {cart.map(item => (
+                    <div key={item.id} className="flex items-center justify-between border-b border-gray-200 py-3">
+                      <div className="flex items-center">
+                        <img src={item.imageUrl || `https://placehold.co/60x60/e0ffe0/333333?text=Item`} alt={item.name} className="w-16 h-16 object-cover rounded-md mr-4" />
+                        <div>
+                          <h3 className="font-semibold text-lg text-gray-800">{item.name}</h3>
+                          <p className="text-green-700 text-md font-bold">RWF {item.price.toLocaleString()}</p>
+                        </div>
+                      </div>
+                      <div className="flex items-center space-x-2">
+                        <button
+                          onClick={() => updateCartQuantity(item.id, item.quantity - 1)}
+                          className="bg-gray-200 text-gray-700 rounded-full w-8 h-8 flex items-center justify-center hover:bg-gray-300"
+                        >-</button>
+                        <span className="font-medium">{item.quantity}</span>
+                        <button
+                          onClick={() => updateCartQuantity(item.id, item.quantity + 1)}
+                          className="bg-gray-200 text-gray-700 rounded-full w-8 h-8 flex items-center justify-center hover:bg-gray-300"
+                        >+</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="border-t border-gray-300 pt-4 mt-4">
+                  <div className="flex justify-between font-semibold text-lg text-gray-800 mb-2">
+                    <span>Subtotal:</span>
+                    <span>RWF {(cart.reduce((sum, item) => sum + item.price * item.quantity, 0)).toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between font-semibold text-lg text-gray-800 mb-2">
+                    <span>Delivery Fee:</span>
+                    <span>RWF {DELIVERY_FEE.toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between font-bold text-xl text-green-800 mb-4">
+                    <span>Total:</span>
+                    <span>RWF {calculateTotal().toLocaleString()}</span>
+                  </div>
+                  <input
+                    type="text"
+                    placeholder="Delivery Address"
+                    value={deliveryAddress}
+                    onChange={(e) => setDeliveryAddress(e.target.value)}
+                    className="w-full p-3 border border-gray-300 rounded-lg mb-4 focus:outline-none focus:ring-2 focus:ring-green-400"
+                  />
+                  <button
+                    onClick={handleCheckout}
+                    className="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 rounded-lg shadow-md transition duration-300 text-lg"
+                  >
+                    Proceed to Checkout
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {showCheckoutModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-xl shadow-2xl p-8 max-w-lg w-full">
+            <h2 className="text-3xl font-bold text-gray-800 mb-6 text-center">Complete Your Payment</h2>
+            <p className="text-gray-700 mb-4 text-center">
+              Please pay <span className="font-bold text-green-700">RWF {calculateTotal().toLocaleString()}</span> via MoMoPay to the seller using the following USSD code:
+            </p>
+            <p className="text-green-800 bg-green-100 p-4 rounded-lg text-center font-mono text-xl mb-6">
+              {currentSellerUssd || 'USSD Code not available'}
+            </p>
+            <p className="text-gray-700 mb-4 text-center">
+              After payment, upload a screenshot of the confirmation:
+            </p>
+            <input
+              type="file"
+              accept="image/*"
+              onChange={(e) => setBuyerPaymentScreenshot(e.target.files[0])}
+              className="w-full text-gray-700 mb-6 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-green-50 file:text-green-700 hover:file:bg-green-100"
+            />
+            {buyerPaymentScreenshot && (
+              <div className="mb-6 text-center">
+                <img src={URL.createObjectURL(buyerPaymentScreenshot)} alt="Payment Screenshot Preview" className="max-w-xs max-h-48 mx-auto rounded-lg shadow-md" />
+                <p className="text-sm text-gray-500 mt-2">Preview of your payment screenshot.</p>
+              </div>
+            )}
+            <div className="flex justify-end gap-4">
+              <button
+                onClick={() => setShowCheckoutModal(false)}
+                className="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-5 rounded-lg transition duration-300"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handlePlaceOrder}
+                disabled={!buyerPaymentScreenshot}
+                className={`bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-5 rounded-lg transition duration-300 ${!buyerPaymentScreenshot && 'opacity-50 cursor-not-allowed'}`}
+              >
+                Place Order
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showContactModal && contactingProduct && (
+        <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-xl shadow-2xl p-8 max-w-lg w-full">
+            <h2 className="text-3xl font-bold text-gray-800 mb-6 text-center">Contact Owner</h2>
+            <p className="text-gray-700 mb-4 text-center">
+              You are about to contact the owner of: <span className="font-bold">{contactingProduct.name}</span>.
+            </p>
+            <p className="text-gray-700 mb-4 text-center">
+              Please use the following contact details:
+            </p>
+            <p className="text-green-800 bg-green-100 p-4 rounded-lg text-center font-mono text-xl mb-4">
+              Owner: {contactingProduct.sellerName || 'N/A'}
+            </p>
+            <p className="text-green-800 bg-green-100 p-4 rounded-lg text-center font-mono text-xl mb-6">
+              Phone: {contactingProduct.sellerPhone || 'N/A'}
+            </p>
+            <p className="text-gray-600 text-sm mb-6 text-center">
+              You can contact them directly to discuss the purchase of this {contactingProduct.category === 'Houses' ? 'house' : 'car'}.
+            </p>
+            <div className="flex justify-end gap-4">
+              <button
+                onClick={() => { setShowContactModal(false); setContactingProduct(null); }}
+                className="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-5 rounded-lg transition duration-300"
+              >
+                Got It
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="flex-grow">
+        <div className="flex flex-wrap gap-4 mb-8 items-center">
+          <div className="flex-1 min-w-[150px]">
+            <label htmlFor="category-select" className="block text-gray-700 text-sm font-semibold mb-2">Category:</label>
+            <select
+              id="category-select"
+              value={selectedCategory}
+              onChange={(e) => {
+                setSelectedCategory(e.target.value);
+                setSelectedSubCategory('All'); // Reset subcategory when category changes
+              }}
+              className="w-full p-3 border border-gray-300 rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-green-400 bg-white"
+            >
+              {categories.map(cat => (
+                <option key={cat} value={cat}>{cat}</option>
+              ))}
+            </select>
+          </div>
+
+          {(selectedCategory !== 'All' && subCategories[selectedCategory]) && (
+            <div className="flex-1 min-w-[150px]">
+              <label htmlFor="subcategory-select" className="block text-gray-700 text-sm font-semibold mb-2">Sub-Category:</label>
+              <select
+                id="subcategory-select"
+                value={selectedSubCategory}
+                onChange={(e) => setSelectedSubCategory(e.target.value)}
+                className="w-full p-3 border border-gray-300 rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-green-400 bg-white"
+              >
+                {subCategories[selectedCategory].map(subCat => (
+                  <option key={subCat} value={subCat}>{subCat}</option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
+
+        {filteredProducts.length === 0 ? (
+          <p className="text-center text-gray-600 text-xl mt-16">No products available in this category yet.</p>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+            {filteredProducts.map(product => (
+              <ProductCard
+                key={product.id}
+                product={product}
+                onAddToCart={handleAddToCart}
+                showSellerInfo={product.category === 'Houses' || product.category === 'Cars'}
+                onProductAction={handleContactOwner}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Seller Dashboard
+function SellerDashboard({ currentUser, userId, signOutUser }) {
+  const [products, setProducts] = useState([]);
+  const [newProduct, setNewProduct] = useState({
+    name: '',
+    description: '',
+    price: '',
+    category: 'Food',
+    subCategory: 'Fruits',
+    imageUrl: '', // This will be simulated or a placeholder
+    sellerId: userId,
+    sellerName: currentUser?.displayName || 'Unknown Seller',
+    sellerPhone: '', // Seller's phone number
+    companyName: '', // Seller's company name
+    momoUssdCode: '', // Seller's MoMoPay USSD code
+    commissionPaid: false,
+    createdAt: serverTimestamp(),
+  });
+  const [message, setMessage] = useState('');
+  const [showProductForm, setShowProductForm] = useState(false);
+  const [editProductId, setEditProductId] = useState(null);
+  const [commissionPaymentScreenshot, setCommissionPaymentScreenshot] = useState(null);
+  const [currentOrders, setCurrentOrders] = useState([]);
+  const [showCommissionModal, setShowCommissionModal] = useState(false);
+  const [commissionProduct, setCommissionProduct] = useState(null); // Product for which commission is being paid
+  const [userProfile, setUserProfile] = useState(null); // To store seller's company, phone, USSD
+
+  const productCategories = {
+    Food: ['Fruits', 'Vegetables', 'Meat', 'Dairy', 'Other Food'],
+    Clothes: ['Kids', 'Men', 'Women', 'Other Clothes'],
+    'Home Tools': ['Plates', 'Kitchenware', 'Furniture', 'Electronics', 'Other Home Materials'],
+    Houses: ['Residential', 'Commercial', 'Land'],
+    Cars: ['Sedan', 'SUV', 'Truck', 'Motorcycle', 'Other Vehicles'],
+  };
+
+  const COMMISSION_USSD_CODE = '*182*8*1*770588#';
+
+  // Fetch seller's profile details once
+  useEffect(() => {
+    if (userId && db) {
+      const userDocRef = doc(db, 'artifacts', appId, 'users', userId);
+      const unsubscribe = onSnapshot(userDocRef, (docSnap) => {
+        if (docSnap.exists()) {
+          setUserProfile(docSnap.data());
+          // Pre-fill seller info for new product
+          setNewProduct(prev => ({
+            ...prev,
+            sellerName: docSnap.data().displayName || prev.sellerName,
+            sellerPhone: docSnap.data().phoneNumber || prev.sellerPhone,
+            companyName: docSnap.data().companyName || prev.companyName,
+            momoUssdCode: docSnap.data().momoUssdCode || prev.momoUssdCode,
+          }));
+        }
+      }, (error) => {
+        console.error("Error fetching user profile:", error);
+      });
+      return () => unsubscribe();
+    }
+  }, [userId, db]);
+
+  // Fetch seller's products
+  useEffect(() => {
+    if (!db || !userId) {
+      setMessage('Firestore not initialized or user not logged in. Cannot fetch products.');
+      return;
+    }
+
+    const productsRef = collection(db, 'artifacts', appId, 'public', 'data', 'products');
+    const q = query(productsRef, where('sellerId', '==', userId)); // Each seller manages their own goods only
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      setProducts(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    }, (error) => {
+      console.error("Error fetching seller products:", error);
+      setMessage("Failed to load your products.");
+    });
+
+    return () => unsubscribe();
+  }, [db, userId]);
+
+  // Fetch seller's orders
+  useEffect(() => {
+    if (!db || !userId) return;
+
+    const ordersRef = collection(db, 'artifacts', appId, 'public', 'data', 'orders');
+    const q = query(ordersRef, where('sellerId', '==', userId));
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      setCurrentOrders(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    }, (error) => {
+      console.error("Error fetching seller orders:", error);
+      setMessage("Failed to load current orders.");
+    });
+
+    return () => unsubscribe();
+  }, [db, userId]);
+
+
+  const handleProductChange = (e) => {
+    const { name, value } = e.target;
+    setNewProduct(prev => ({ ...prev, [name]: value }));
+  };
+
+  const handleCategoryChange = (e) => {
+    const newCat = e.target.value;
+    setNewProduct(prev => ({
+      ...prev,
+      category: newCat,
+      subCategory: productCategories[newCat][0] // Set default sub-category for new category
+    }));
+  };
+
+  const handleImageUpload = (e) => {
+    if (e.target.files && e.target.files[0]) {
+      // In a real app, upload to Firebase Storage and get a URL.
+      // For this simulation, we'll use URL.createObjectURL for client-side preview.
+      setNewProduct(prev => ({ ...prev, imageUrl: URL.createObjectURL(e.target.files[0]) })); // Fixed syntax here
+      setMessage('Image selected for preview.');
+    }
+  };
+
+  const handleCommissionScreenshotUpload = (e) => {
+    if (e.target.files && e.target.files[0]) {
+      setCommissionPaymentScreenshot(e.target.files[0]);
+      setMessage('Commission payment screenshot selected.');
+    }
+  };
+
+  const handleSaveProduct = async (e) => {
+    e.preventDefault();
+    if (!currentUser) {
+      setMessage('Please sign in to add products.');
+      return;
+    }
+    if (!newProduct.name || !newProduct.price || !newProduct.category || !newProduct.imageUrl) {
+      setMessage('Please fill all required product fields and upload an image.');
+      return;
+    }
+    if (isNaN(newProduct.price) || parseFloat(newProduct.price) <= 0) {
+      setMessage('Price must be a positive number.');
+      return;
+    }
+
+    // Ensure seller profile is updated with company, phone, USSD
+    if (!userProfile?.companyName || !userProfile?.phoneNumber || !userProfile?.momoUssdCode) {
+      setMessage('Please update your seller profile (Company Name, Phone, MoMoPay USSD) before adding products.');
+      return;
+    }
+
+
+    try {
+      if (editProductId) {
+        // Update existing product
+        const productDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'products', editProductId);
+        await updateDoc(productDocRef, {
+          name: newProduct.name,
+          description: newProduct.description,
+          price: parseFloat(newProduct.price),
+          category: newProduct.category,
+          subCategory: newProduct.subCategory,
+          imageUrl: newProduct.imageUrl, // Will be updated if a new file was selected
+        });
+        setMessage('Product updated successfully!');
+      } else {
+        // Add new product
+        // Commission calculation: 5% of price
+        const commissionAmount = parseFloat(newProduct.price) * 0.05;
+
+        // Set commission details for the modal
+        setCommissionProduct({
+          ...newProduct,
+          price: parseFloat(newProduct.price),
+          commissionAmount: commissionAmount,
+          sellerId: userId,
+          sellerName: currentUser.displayName,
+          sellerPhone: userProfile.phoneNumber, // Use fetched profile phone
+          companyName: userProfile.companyName, // Use fetched profile company
+        });
+        setShowCommissionModal(true); // Show commission payment modal
+      }
+      setShowProductForm(false);
+      setEditProductId(null);
+      setNewProduct({
+        name: '',
+        description: '',
+        price: '',
+        category: 'Food',
+        subCategory: 'Fruits',
+        imageUrl: '',
+        sellerId: userId,
+        sellerName: currentUser?.displayName || 'Unknown Seller',
+        sellerPhone: userProfile?.phoneNumber || '',
+        companyName: userProfile?.companyName || '',
+        momoUssdCode: userProfile?.momoUssdCode || '',
+        commissionPaid: false,
+        createdAt: serverTimestamp(),
+      });
+      setCommissionPaymentScreenshot(null); // Clear screenshot after successful submission
+    } catch (error) {
+      console.error("Error saving product:", error);
+      setMessage('Failed to save product.');
+    }
+  };
+
+  const handleInitiateCommissionPayment = async () => {
+    if (!commissionProduct) return;
+    if (!commissionPaymentScreenshot) {
+      setMessage('Please upload the commission payment screenshot.');
+      return;
+    }
+
+    try {
+      // Add a record of the commission payment for admin verification
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'commissionPayments'), {
+        sellerId: userId,
+        productId: null, // This payment is for a new product, no product ID yet (admin will link implicitly)
+        productName: commissionProduct.name,
+        amount: commissionProduct.commissionAmount,
+        screenshotUrl: URL.createObjectURL(commissionPaymentScreenshot), // Simulate URL for screenshot
+        verified: false,
+        createdAt: serverTimestamp(),
+      });
+
+      // Insert the product with commissionPaid: false, it will be made live by admin after verification
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'products'), {
+        ...commissionProduct,
+        commissionPaid: false, // Will be set to true by admin after verification
+        createdAt: serverTimestamp(),
+      });
+
+      setMessage('Commission payment details submitted. Product will be live after admin verification.');
+      setShowCommissionModal(false);
+      setCommissionProduct(null);
+      setCommissionPaymentScreenshot(null);
+    } catch (error) {
+      console.error("Error submitting commission payment:", error);
+      setMessage('Failed to submit commission payment.');
+    }
+  };
+
+  const handleEditProduct = (product) => {
+    setEditProductId(product.id);
+    setNewProduct({ ...product, price: product.price.toString() }); // Ensure price is string for input
+    setShowProductForm(true);
+  };
+
+  const handleDeleteProduct = async (id) => {
+    // Replaced window.confirm with MessageBox for consistency
+    setMessage('Are you sure you want to delete this product?'); // This MessageBox doesn't support confirm,
+                                                              // so a real prompt would be needed if truly required.
+                                                              // For now, it will act as a warning only.
+      try {
+        await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'products', id));
+        setMessage('Product deleted successfully!');
+      } catch (error) {
+        console.error("Error deleting product:", error);
+        setMessage('Failed to delete product.');
+      }
+  };
+
+  const handleVerifyBuyerPayment = async (orderId) => {
+    try {
+      const orderRef = doc(db, 'artifacts', appId, 'public', 'data', 'orders', orderId);
+      await updateDoc(orderRef, {
+        buyerPaymentVerified: true,
+        status: 'Confirmed by Seller',
+      });
+      setMessage('Buyer payment verified and order confirmed!');
+    } catch (error) {
+      console.error("Error verifying buyer payment:", error);
+      setMessage('Failed to verify buyer payment.');
+    }
+  };
+
+  const handleUpdateSellerProfile = async (e) => {
+    e.preventDefault();
+    try {
+      const userDocRef = doc(db, 'artifacts', appId, 'users', userId);
+      await setDoc(userDocRef, { // Using setDoc with merge true to update existing fields
+        companyName: newProduct.companyName,
+        phoneNumber: newProduct.sellerPhone,
+        momoUssdCode: newProduct.momoUssdCode,
+      }, {merge: true});
+      setMessage('Profile updated successfully!');
+      // Update local state to reflect changes immediately
+      setUserProfile(prev => ({
+        ...prev,
+        companyName: newProduct.companyName,
+        phoneNumber: newProduct.sellerPhone,
+        momoUssdCode: newProduct.momoUssdCode,
+      }));
+    } catch (error) {
+      console.error("Error updating seller profile:", error);
+      setMessage('Failed to update profile.');
+    }
+  };
+
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-green-50 to-green-100 p-6 flex flex-col font-inter">
+      <header className="flex justify-between items-center pb-6 border-b border-green-200 mb-6">
+        <h1 className="text-4xl font-extrabold text-green-800 drop-shadow-sm">Seller Dashboard</h1>
+        <div className="flex items-center space-x-4">
+          <span className="text-gray-700 text-sm">Hello, {currentUser?.displayName || 'Seller'}! ({userId})</span>
+          <button
+            onClick={signOutUser}
+            className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-300"
+          >
+            Sign Out
+          </button>
+        </div>
+      </header>
+
+      {message && <MessageBox message={message} onClose={() => setMessage('')} />}
+
+      {showCommissionModal && commissionProduct && (
+        <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-xl shadow-2xl p-8 max-w-lg w-full">
+            <h2 className="text-3xl font-bold text-gray-800 mb-6 text-center">Pay Commission to Post Product</h2>
+            <p className="text-gray-700 mb-4 text-center">
+              To post your product "<span className="font-bold">{commissionProduct.name}</span>", you need to pay a 5% commission.
+            </p>
+            <p className="text-lg text-gray-700 mb-4 text-center">
+              Commission Amount: <span className="font-bold text-green-700">RWF {commissionProduct.commissionAmount.toLocaleString()}</span>
+            </p>
+            <p className="text-gray-700 mb-4 text-center">
+              Please pay via MoMoPay using the following USSD code:
+            </p>
+            <p className="text-green-800 bg-green-100 p-4 rounded-lg text-center font-mono text-xl mb-6">
+              {COMMISSION_USSD_CODE}
+            </p>
+            <p className="text-gray-700 mb-4 text-center">
+              After payment, upload a screenshot for admin verification:
+            </p>
+            <input
+              type="file"
+              accept="image/*"
+              onChange={handleCommissionScreenshotUpload}
+              className="w-full text-gray-700 mb-6 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-green-50 file:text-green-700 hover:file:bg-green-100"
+            />
+            {commissionPaymentScreenshot && (
+              <div className="mb-6 text-center">
+                <img src={URL.createObjectURL(commissionPaymentScreenshot)} alt="Commission Screenshot Preview" className="max-w-xs max-h-48 mx-auto rounded-lg shadow-md" />
+                <p className="text-sm text-gray-500 mt-2">Preview of your commission payment screenshot.</p>
+              </div>
+            )}
+            <div className="flex justify-end gap-4">
+              <button
+                onClick={() => { setShowCommissionModal(false); setCommissionProduct(null); setCommissionPaymentScreenshot(null); }}
+                className="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-5 rounded-lg transition duration-300"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleInitiateCommissionPayment}
+                disabled={!commissionPaymentScreenshot}
+                className={`bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-5 rounded-lg transition duration-300 ${!commissionPaymentScreenshot && 'opacity-50 cursor-not-allowed'}`}
+              >
+                Submit for Verification
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 flex-grow">
+        {/* Seller Profile Section */}
+        <div className="col-span-1 bg-white p-6 rounded-xl shadow-lg flex flex-col">
+          <h2 className="text-2xl font-bold text-gray-800 mb-4">Your Profile</h2>
+          <form onSubmit={handleUpdateSellerProfile} className="space-y-4">
+            <div>
+              <label htmlFor="companyName" className="block text-gray-700 text-sm font-semibold mb-2">Company Name:</label>
+              <input
+                type="text"
+                id="companyName"
+                name="companyName"
+                value={newProduct.companyName}
+                onChange={handleProductChange}
+                placeholder="Your Company Name"
+                className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-400"
+                required
+              />
+            </div>
+            <div>
+              <label htmlFor="sellerPhone" className="block text-gray-700 text-sm font-semibold mb-2">Phone Number:</label>
+              <input
+                type="tel"
+                id="sellerPhone"
+                name="sellerPhone"
+                value={newProduct.sellerPhone}
+                onChange={handleProductChange}
+                placeholder="e.g., 2507XXXXXXXX"
+                className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-400"
+                required
+              />
+            </div>
+            <div>
+              <label htmlFor="momoUssdCode" className="block text-gray-700 text-sm font-semibold mb-2">MoMoPay USSD Code:</label>
+              <input
+                type="text"
+                id="momoUssdCode"
+                name="momoUssdCode"
+                value={newProduct.momoUssdCode}
+                onChange={handleProductChange}
+                placeholder="e.g., *182*8*1*XXXXXX#"
+                className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-400"
+                required
+              />
+            </div>
+            <button
+              type="submit"
+              className="w-full bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 rounded-lg shadow-md transition duration-300"
+            >
+              Update Profile
+            </button>
+          </form>
+        </div>
+
+        {/* Product Management Section */}
+        <div className="col-span-2 bg-white p-6 rounded-xl shadow-lg">
+          <div className="flex justify-between items-center mb-4">
+            <h2 className="text-2xl font-bold text-gray-800">Your Products</h2>
+            <button
+              onClick={() => { setShowProductForm(!showProductForm); setEditProductId(null); setNewProduct(prev => ({
+                ...prev,
+                name: '', description: '', price: '', imageUrl: '',
+                category: 'Food', subCategory: 'Fruits'
+              })); }}
+              className="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-300"
+            >
+              {showProductForm ? 'Cancel Add Product' : 'Add New Product'}
+            </button>
+          </div>
+
+          {showProductForm && (
+            <form onSubmit={handleSaveProduct} className="bg-gray-50 p-6 rounded-lg mb-6 shadow-inner space-y-4">
+              <h3 className="text-xl font-semibold text-gray-800 mb-4">{editProductId ? 'Edit Product' : 'Add New Product'}</h3>
+              <div>
+                <label htmlFor="productName" className="block text-gray-700 text-sm font-semibold mb-2">Product Name:</label>
+                <input
+                  type="text"
+                  id="productName"
+                  name="name"
+                  value={newProduct.name}
+                  onChange={handleProductChange}
+                  placeholder="e.g., Fresh Avocados"
+                  className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-400"
+                  required
+                />
+              </div>
+              <div>
+                <label htmlFor="productDescription" className="block text-gray-700 text-sm font-semibold mb-2">Description:</label>
+                <textarea
+                  id="productDescription"
+                  name="description"
+                  value={newProduct.description}
+                  onChange={handleProductChange}
+                  rows="3"
+                  placeholder="Describe your product here..."
+                  className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-400"
+                ></textarea>
+              </div>
+              <div>
+                <label htmlFor="productPrice" className="block text-gray-700 text-sm font-semibold mb-2">Price (RWF):</label>
+                <input
+                  type="number"
+                  id="productPrice"
+                  name="price"
+                  value={newProduct.price}
+                  onChange={handleProductChange}
+                  placeholder="e.g., 5000"
+                  className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-400"
+                  required
+                />
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label htmlFor="productCategory" className="block text-gray-700 text-sm font-semibold mb-2">Category:</label>
+                  <select
+                    id="productCategory"
+                    name="category"
+                    value={newProduct.category}
+                    onChange={handleCategoryChange}
+                    className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-400 bg-white"
+                    required
+                  >
+                    {Object.keys(productCategories).map(cat => (
+                      <option key={cat} value={cat}>{cat}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="productSubCategory" className="block text-gray-700 text-sm font-semibold mb-2">Sub-Category:</label>
+                  <select
+                    id="productSubCategory"
+                    name="subCategory"
+                    value={newProduct.subCategory}
+                    onChange={handleProductChange}
+                    className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-400 bg-white"
+                    required
+                  >
+                    {productCategories[newProduct.category].map(subCat => (
+                      <option key={subCat} value={subCat}>{subCat}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label htmlFor="productImage" className="block text-gray-700 text-sm font-semibold mb-2">Product Image:</label>
+                <input
+                  type="file"
+                  id="productImage"
+                  accept="image/*"
+                  onChange={handleImageUpload}
+                  className="w-full text-gray-700 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-green-50 file:text-green-700 hover:file:bg-green-100"
+                  required={!editProductId || !newProduct.imageUrl} // Required for new product or if existing product has no image
+                />
+                {newProduct.imageUrl && (
+                  <img src={newProduct.imageUrl} alt="Product Preview" className="mt-4 w-32 h-32 object-cover rounded-md shadow-sm" />
+                )}
+              </div>
+              <button
+                type="submit"
+                className="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 rounded-lg shadow-md transition duration-300"
+              >
+                {editProductId ? 'Update Product' : 'Add Product'}
+              </button>
+            </form>
+          )}
+
+          {products.length === 0 ? (
+            <p className="text-center text-gray-600 text-lg mt-8">You haven't added any products yet.</p>
+          ) : (
+            <div className="space-y-4">
+              {products.map(product => (
+                <div key={product.id} className="bg-gray-50 p-4 rounded-lg shadow-sm flex items-center justify-between">
+                  <div className="flex items-center">
+                    <img src={product.imageUrl || `https://placehold.co/80x60/e0ffe0/333333?text=Prod`} alt={product.name} className="w-20 h-16 object-cover rounded-md mr-4" />
+                    <div>
+                      <h3 className="font-semibold text-lg text-gray-900">{product.name}</h3>
+                      <p className="text-green-700 font-bold">RWF {product.price.toLocaleString()}</p>
+                      <p className="text-gray-500 text-sm">Status: {product.commissionPaid ? 'Live' : 'Pending Admin Verification'}</p>
+                    </div>
+                  </div>
+                  <div className="flex space-x-2">
+                    <button
+                      onClick={() => handleEditProduct(product)}
+                      className="bg-blue-100 hover:bg-blue-200 text-blue-700 py-1 px-3 rounded-full text-sm font-medium transition duration-200"
+                    >
+                      Edit
+                    </button>
+                    <button
+                      onClick={() => handleDeleteProduct(product.id)}
+                      className="bg-red-100 hover:bg-red-200 text-red-700 py-1 px-3 rounded-full text-sm font-medium transition duration-200"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Current Orders Section */}
+        <div className="col-span-full bg-white p-6 rounded-xl shadow-lg mt-6">
+          <h2 className="text-2xl font-bold text-gray-800 mb-4">Current Orders</h2>
+          {currentOrders.length === 0 ? (
+            <p className="text-center text-gray-600 text-lg mt-8">No incoming orders yet.</p>
+          ) : (
+            <div className="space-y-4">
+              {currentOrders.map(order => (
+                <div key={order.id} className="bg-gray-50 p-4 rounded-lg shadow-sm">
+                  <h3 className="font-semibold text-lg text-gray-900">Order for: {order.productName} (x{order.quantity})</h3>
+                  <p className="text-gray-700">Total: <span className="font-bold">RWF {order.totalPrice.toLocaleString()}</span></p>
+                  <p className="text-gray-600 text-sm">Delivery Address: {order.deliveryAddress}</p>
+                  <p className="text-gray-600 text-sm">Status: <span className={`${order.status === 'Pending Seller Confirmation' ? 'text-orange-500' : 'text-green-600'} font-medium`}>{order.status}</span></p>
+                  <p className="text-gray-600 text-sm">Buyer ID: {order.buyerId}</p>
+                  {order.buyerPaymentScreenshotUrl && (
+                    <div className="mt-3">
+                      <p className="text-gray-700 font-medium mb-2">Buyer's Payment Screenshot:</p>
+                      <img src={order.buyerPaymentScreenshotUrl} alt="Buyer Payment" className="max-w-xs max-h-48 rounded-md shadow-md" />
+                    </div>
+                  )}
+                  {!order.buyerPaymentVerified && (
+                    <button
+                      onClick={() => handleVerifyBuyerPayment(order.id)}
+                      className="mt-4 bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-300"
+                    >
+                      Verify Buyer Payment
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Admin Dashboard
+function AdminDashboard({ signOutUser }) {
+  const [password, setPassword] = useState('');
+  const [loggedIn, setLoggedIn] = useState(false);
+  const [message, setMessage] = useState('');
+  const [commissionPayments, setCommissionPayments] = useState([]);
+  const [allProducts, setAllProducts] = useState([]);
+  const [allOrders, setAllOrders] = useState([]);
+  const [workers, setWorkers] = useState([]);
+  const [newWorkerEmail, setNewWorkerEmail] = useState('');
+  const [adminSection, setAdminSection] = useState('commissions'); // commissions, products, orders, workers
+
+  const ADMIN_PASSWORD = '909582'; // Hardcoded admin password
+
+  // Fetch data
+  useEffect(() => {
+    if (!db || !loggedIn) return;
+
+    // Commission Payments
+    const unsubscribeCommissions = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'commissionPayments'), (snapshot) => {
+      setCommissionPayments(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    }, (error) => {
+      console.error("Error fetching commission payments:", error);
+    });
+
+    // All Products
+    const unsubscribeProducts = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'products'), (snapshot) => {
+      setAllProducts(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    }, (error) => {
+      console.error("Error fetching all products:", error);
+    });
+
+    // All Orders
+    const unsubscribeOrders = onSnapshot(collection(db, 'artifacts', appId, 'public', 'data', 'orders'), (snapshot) => {
+      setAllOrders(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    }, (error) => {
+      console.error("Error fetching all orders:", error);
+    });
+
+    // Workers
+    const usersRef = collection(db, 'artifacts', appId, 'users');
+    const qWorkers = query(usersRef, where('role', '==', 'worker'));
+    const unsubscribeWorkers = onSnapshot(qWorkers, (snapshot) => {
+      setWorkers(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    }, (error) => {
+      console.error("Error fetching workers:", error);
+    });
+
+
+    return () => {
+      unsubscribeCommissions();
+      unsubscribeProducts();
+      unsubscribeOrders();
+      unsubscribeWorkers();
+    };
+  }, [db, loggedIn]);
+
+  const handleAdminLogin = (e) => {
+    e.preventDefault();
+    if (password === ADMIN_PASSWORD) {
+      setLoggedIn(true);
+      setMessage('Admin login successful!');
+    } else {
+      setMessage('Incorrect password.');
+    }
+  };
+
+  const handleVerifyCommissionPayment = async (paymentId) => {
+    try {
+      // 1. Update commission payment status
+      const paymentRef = doc(db, 'artifacts', appId, 'public', 'data', 'commissionPayments', paymentId);
+      await updateDoc(paymentRef, { verified: true });
+
+      // 2. Find the product associated with this commission payment
+      const commissionPayment = commissionPayments.find(cp => cp.id === paymentId);
+      if (commissionPayment) {
+          const productToUpdate = allProducts.find(p => p.name === commissionPayment.productName &&
+                                                         p.sellerId === commissionPayment.sellerId &&
+                                                         !p.commissionPaid); // Ensure we only target unverified products
+
+          if (productToUpdate) {
+            const productRef = doc(db, 'artifacts', appId, 'public', 'data', 'products', productToUpdate.id);
+            await updateDoc(productRef, { commissionPaid: true });
+            setMessage('Commission payment verified and product made live!');
+          } else {
+            setMessage('Commission payment verified, but corresponding product not found or already live.');
+          }
+      } else {
+        setMessage('Commission payment record not found.');
+      }
+
+    } catch (error) {
+      console.error("Error verifying commission payment:", error);
+      setMessage('Failed to verify commission payment.');
+    }
+  };
+
+  const handleVerifyBuyerOrderPayment = async (orderId) => {
+    try {
+      const orderRef = doc(db, 'artifacts', appId, 'public', 'data', 'orders', orderId);
+      await updateDoc(orderRef, {
+        buyerPaymentVerified: true,
+        status: 'Confirmed by Admin',
+      });
+      setMessage('Buyer order payment verified by Admin!');
+    } catch (error) {
+      console.error("Error verifying buyer order payment:", error);
+      setMessage('Failed to verify buyer order payment.');
+    }
+  };
+
+  const handleAddWorker = async (e) => {
+    e.preventDefault();
+    if (!newWorkerEmail.trim()) {
+      setMessage('Please enter a worker email.');
+      return;
+    }
+    try {
+      // In a real app, you'd create a Firebase user and set a custom claim/role.
+      // Here, we just add/update a record in the 'users' collection with role 'worker'.
+      // This worker will still need to sign in with Google using this email.
+      const usersCollectionRef = collection(db, 'artifacts', appId, 'users');
+      const q = query(usersCollectionRef, where('email', '==', newWorkerEmail));
+      const querySnapshot = await getDocs(q);
+
+      if (querySnapshot.empty) {
+        // If email doesn't exist, create a new user entry with worker role
+        const newWorkerDocRef = doc(usersCollectionRef); // Firestore will generate ID
+        await setDoc(newWorkerDocRef, {
+          email: newWorkerEmail,
+          role: 'worker',
+          createdAt: serverTimestamp(),
+          // displayName, photoURL will be added when they sign in with Google
+        });
+        setMessage(`Worker access point created for ${newWorkerEmail}. They should sign in with Google.`);
+      } else {
+        // If email exists, update their role to worker if not already
+        const userDoc = querySnapshot.docs[0];
+        if (userDoc.data().role !== 'worker') {
+          await updateDoc(doc(db, 'artifacts', appId, 'users', userDoc.id), { role: 'worker' });
+          setMessage(`User ${newWorkerEmail} role updated to worker.`);
+        } else {
+          setMessage(`${newWorkerEmail} is already a worker.`);
+        }
+      }
+      setNewWorkerEmail('');
+    } catch (error) {
+      console.error("Error adding worker:", error);
+      setMessage('Failed to add worker.');
+    }
+  };
+
+  const handleDeleteWorker = async (workerId) => {
+    // Replaced window.confirm with MessageBox for consistency
+    setMessage("Are you sure you want to remove this worker?"); // This MessageBox does not confirm, but warns.
+      try {
+        const userDocRef = doc(db, 'artifacts', appId, 'users', workerId);
+        // Instead of deleting, just change their role if they are also a buyer/seller
+        await updateDoc(userDocRef, { role: 'buyer' }); // Revert to a default role or remove if only worker
+        setMessage('Worker removed successfully (role changed to buyer).');
+      } catch (error) {
+        console.error("Error deleting worker:", error);
+        setMessage('Failed to remove worker.');
+      }
+  };
+
+
+  if (!loggedIn) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-200 flex items-center justify-center p-4 font-inter">
+        <form onSubmit={handleAdminLogin} className="bg-white rounded-xl shadow-lg p-8 w-full max-w-md">
+          <h2 className="text-3xl font-bold text-gray-800 mb-6 text-center">Admin Login</h2>
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="Admin Password"
+            className="w-full p-3 border border-gray-300 rounded-lg mb-4 focus:outline-none focus:ring-2 focus:ring-green-400"
+            required
+          />
+          <button
+            type="submit"
+            className="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 rounded-lg shadow-md transition duration-300"
+          >
+            Login
+          </button>
+          {message && <MessageBox message={message} onClose={() => setMessage('')} />}
+        </form>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-green-50 to-green-100 p-6 flex flex-col font-inter">
+      <header className="flex justify-between items-center pb-6 border-b border-green-200 mb-6">
+        <h1 className="text-4xl font-extrabold text-green-800 drop-shadow-sm">Admin Dashboard</h1>
+        <button
+          onClick={signOutUser}
+          className="bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-300"
+        >
+          Sign Out
+        </button>
+      </header>
+
+      {message && <MessageBox message={message} onClose={() => setMessage('')} />}
+
+      <div className="flex flex-col md:flex-row gap-6 flex-grow">
+        {/* Sidebar Navigation */}
+        <nav className="bg-white p-6 rounded-xl shadow-lg w-full md:w-64 flex-shrink-0">
+          <ul className="space-y-3">
+            <li>
+              <button
+                onClick={() => setAdminSection('commissions')}
+                className={`w-full text-left p-3 rounded-lg font-medium transition duration-200 ${adminSection === 'commissions' ? 'bg-green-100 text-green-700' : 'text-gray-700 hover:bg-gray-50'}`}
+              >
+                Commission Payments ({commissionPayments.filter(p => !p.verified).length})
+              </button>
+            </li>
+            <li>
+              <button
+                onClick={() => setAdminSection('products')}
+                className={`w-full text-left p-3 rounded-lg font-medium transition duration-200 ${adminSection === 'products' ? 'bg-green-100 text-green-700' : 'text-gray-700 hover:bg-gray-50'}`}
+              >
+                All Products
+              </button>
+            </li>
+            <li>
+              <button
+                onClick={() => setAdminSection('orders')}
+                className={`w-full text-left p-3 rounded-lg font-medium transition duration-200 ${adminSection === 'orders' ? 'bg-green-100 text-green-700' : 'text-gray-700 hover:bg-gray-50'}`}
+              >
+                All Orders ({allOrders.filter(o => !o.buyerPaymentVerified).length})
+              </button>
+            </li>
+            <li>
+              <button
+                onClick={() => setAdminSection('workers')}
+                className={`w-full text-left p-3 rounded-lg font-medium transition duration-200 ${adminSection === 'workers' ? 'bg-green-100 text-green-700' : 'text-gray-700 hover:bg-gray-50'}`}
+              >
+                Manage Workers
+              </button>
+            </li>
+          </ul>
+        </nav>
+
+        {/* Content Area */}
+        <div className="flex-grow bg-white p-6 rounded-xl shadow-lg">
+          {adminSection === 'commissions' && (
+            <div>
+              <h2 className="text-2xl font-bold text-gray-800 mb-4">Commission Payments for Verification</h2>
+              {commissionPayments.filter(p => !p.verified).length === 0 ? (
+                <p className="text-center text-gray-600 text-lg mt-8">No unverified commission payments.</p>
+              ) : (
+                <div className="space-y-4">
+                  {commissionPayments.filter(p => !p.verified).map(payment => (
+                    <div key={payment.id} className="bg-gray-50 p-4 rounded-lg shadow-sm flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                      <div>
+                        <p className="font-semibold text-lg text-gray-900">Seller: {payment.sellerName || 'N/A'} (ID: {payment.sellerId})</p>
+                        <p className="text-gray-700">Amount: <span className="font-bold text-green-700">RWF {payment.amount.toLocaleString()}</span></p>
+                        <p className="text-gray-600 text-sm">For Product: {payment.productName || 'N/A'}</p>
+                        <p className="text-gray-500 text-xs">Paid on: {payment.createdAt?.toDate().toLocaleString()}</p>
+                      </div>
+                      {payment.screenshotUrl && (
+                        <div className="flex flex-col items-center">
+                          <p className="text-gray-700 font-medium mb-2">Screenshot:</p>
+                          <img src={payment.screenshotUrl} alt="Commission Payment" className="max-w-[150px] max-h-32 rounded-md shadow-md" />
+                        </div>
+                      )}
+                      <button
+                        onClick={() => handleVerifyCommissionPayment(payment.id)}
+                        className="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-300"
+                      >
+                        Verify Payment & Approve Product
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {adminSection === 'products' && (
+            <div>
+              <h2 className="text-2xl font-bold text-gray-800 mb-4">All Products</h2>
+              {allProducts.length === 0 ? (
+                <p className="text-center text-gray-600 text-lg mt-8">No products available in the system.</p>
+              ) : (
+                <div className="space-y-4">
+                  {allProducts.map(product => (
+                    <div key={product.id} className="bg-gray-50 p-4 rounded-lg shadow-sm flex items-center justify-between">
+                      <div className="flex items-center">
+                        <img src={product.imageUrl || `https://placehold.co/80x60/e0ffe0/333333?text=Prod`} alt={product.name} className="w-20 h-16 object-cover rounded-md mr-4" />
+                        <div>
+                          <h3 className="font-semibold text-lg text-gray-900">{product.name}</h3>
+                          <p className="text-green-700 font-bold">RWF {product.price.toLocaleString()}</p>
+                          <p className="text-gray-500 text-sm">Seller: {product.sellerName || 'N/A'}</p>
+                          <p className="text-gray-500 text-sm">Status: <span className={`${product.commissionPaid ? 'text-green-600' : 'text-orange-500'} font-medium`}>{product.commissionPaid ? 'Live' : 'Pending Commission'}</span></p>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {adminSection === 'orders' && (
+            <div>
+              <h2 className="text-2xl font-bold text-gray-800 mb-4">All Orders</h2>
+              {allOrders.length === 0 ? (
+                <p className="text-center text-gray-600 text-lg mt-8">No orders in the system.</p>
+              ) : (
+                <div className="space-y-4">
+                  {allOrders.map(order => (
+                    <div key={order.id} className="bg-gray-50 p-4 rounded-lg shadow-sm flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                      <div>
+                        <p className="font-semibold text-lg text-gray-900">Product: {order.productName} (x{order.quantity})</p>
+                        <p className="text-gray-700">Total: <span className="font-bold">RWF {order.totalPrice.toLocaleString()}</span></p>
+                        <p className="text-gray-600 text-sm">Buyer: {order.buyerId}</p>
+                        <p className="text-gray-600 text-sm">Seller: {order.sellerId}</p>
+                        <p className="text-gray-600 text-sm">Address: {order.deliveryAddress}</p>
+                        <p className="text-gray-600 text-sm">Status: <span className={`${order.status.includes('Pending') ? 'text-orange-500' : 'text-green-600'} font-medium`}>{order.status}</span></p>
+                      </div>
+                      {order.buyerPaymentScreenshotUrl && (
+                        <div className="flex flex-col items-center">
+                          <p className="text-gray-700 font-medium mb-2">Buyer Screenshot:</p>
+                          <img src={order.buyerPaymentScreenshotUrl} alt="Buyer Payment" className="max-w-[150px] max-h-32 rounded-md shadow-md" />
+                        </div>
+                      )}
+                      {!order.buyerPaymentVerified && (
+                        <button
+                          onClick={() => handleVerifyBuyerOrderPayment(order.id)}
+                          className="bg-green-500 hover:bg-green-600 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-300"
+                        >
+                          Verify Buyer Payment
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {adminSection === 'workers' && (
+            <div>
+              <h2 className="text-2xl font-bold text-gray-800 mb-4">Manage Website Workers</h2>
+              <form onSubmit={handleAddWorker} className="mb-6 bg-gray-50 p-6 rounded-lg shadow-inner flex flex-col md:flex-row gap-4 items-end">
+                <div className="flex-grow">
+                  <label htmlFor="newWorkerEmail" className="block text-gray-700 text-sm font-semibold mb-2">New Worker Email:</label>
+                  <input
+                    type="email"
+                    id="newWorkerEmail"
+                    value={newWorkerEmail}
+                    onChange={(e) => setNewWorkerEmail(e.target.value)}
+                    placeholder="worker@example.com"
+                    className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-400"
+                    required
+                  />
+                </div>
+                <button
+                  type="submit"
+                  className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-300"
+                >
+                  Add Worker
+                </button>
+              </form>
+
+              {workers.length === 0 ? (
+                <p className="text-center text-gray-600 text-lg mt-8">No workers added yet.</p>
+              ) : (
+                <div className="space-y-4">
+                  {workers.map(worker => (
+                    <div key={worker.id} className="bg-gray-50 p-4 rounded-lg shadow-sm flex items-center justify-between">
+                      <div>
+                        <p className="font-semibold text-lg text-gray-900">{worker.displayName || 'Unnamed Worker'}</p>
+                        <p className="text-gray-700 text-sm">{worker.email}</p>
+                        <p className="text-gray-500 text-xs">User ID: {worker.uid || worker.id}</p>
+                      </div>
+                      <button
+                        onClick={() => handleDeleteWorker(worker.id)}
+                        className="bg-red-100 hover:bg-red-200 text-red-700 py-1 px-3 rounded-full text-sm font-medium transition duration-200"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Main App Component
+function App() {
+  const { currentUser, userId, userRole, loadingAuth, signInWithGoogle, signOutUser, setUserRole } = useAuth();
+  const [selectedInitialRole, setSelectedInitialRole] = useState(null); // New state to hold the first chosen role
+
+  // First, always show role selection if not selected yet
+  if (!selectedInitialRole) {
+    return <RoleSelection onSelectRole={setSelectedInitialRole} />;
+  }
+
+  // If Admin role selected initially, go to AdminDashboard (which handles its own password login)
+  if (selectedInitialRole === 'admin') {
+    return <AdminDashboard signOutUser={signOutUser} />;
+  }
+
+  // For Buyer/Seller, proceed with Firebase auth flow
+  // Show loading while Firebase auth status is determined
+  if (loadingAuth) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-green-50 to-green-200 font-inter">
+        <div className="text-center text-green-800 text-2xl font-semibold">Loading user data...</div>
+      </div>
+    );
+  }
+
+  // If user is not authenticated (for buyer/seller path)
+  // This screen prompts them to sign in with Google based on their selected role
+  if (!currentUser) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-green-50 to-green-200 flex flex-col items-center justify-center p-4 font-inter">
+        <h2 className="text-4xl font-extrabold text-green-800 mb-8 drop-shadow-lg">Welcome as a {selectedInitialRole.charAt(0).toUpperCase() + selectedInitialRole.slice(1)}!</h2>
+        <p className="text-xl text-gray-700 mb-6 text-center">Please sign in with Google to continue your journey.</p>
+        <button
+          onClick={() => signInWithGoogle(selectedInitialRole)} // Pass the pre-selected role to Google sign-in
+          className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 px-8 rounded-full shadow-lg hover:shadow-xl transform hover:scale-105 transition duration-300 flex items-center gap-3 text-xl"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" className="inline-block">
+            <path d="M12 0c-6.627 0-12 5.373-12 12s5.373 12 12 12 12-5.373 12-12-5.373-12-12-12zm-.001 3.247c1.403 0 2.536 1.133 2.536 2.536s-1.133 2.536-2.536 2.536-2.536-1.133-2.536-2.536 1.133-2.536 2.536-2.536zm-.001 4.544c-3.155 0-5.711 2.556-5.711 5.711 0 3.155 2.556 5.711 5.711 5.711s5.711-2.556 5.711-5.711c0-3.155-2.556-5.711-5.711-5.711zm-.001 2.593c2.757 0 5 2.243 5 5s-2.243 5-5 5-5-2.243-5-5 2.243-5 5-5z"/>
+          </svg>
+          Sign in with Google
+        </button>
+      </div>
+    );
+  }
+
+  // If user is authenticated and userRole is set (fetched from Firestore)
+  // This handles returning users as well, redirecting them to their correct dashboard
+  if (userRole === 'seller') {
+    return <SellerDashboard currentUser={currentUser} userId={userId} signOutUser={signOutUser} />;
+  } else if (userRole === 'buyer' || userRole === 'worker') { // Workers can also browse like buyers
+    return <BuyerDashboard currentUser={currentUser} userId={userId} signOutUser={signOutUser} />;
+  }
+
+  // Fallback if role is somehow invalid or not yet set by Firestore for an authenticated user
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-red-50 to-red-200 font-inter">
+      <MessageBox message={"Something went wrong. Your user role could not be determined. Please sign out and try again."} onClose={signOutUser} />
+      <button onClick={signOutUser} className="mt-4 bg-red-500 hover:bg-red-600 text-white font-bold py-2 px-4 rounded-lg shadow-md transition duration-300">
+        Sign Out
+      </button>
+    </div>
+  );
+}
+
+export default function Root() {
+  return (
+    <AuthProvider>
+      <App />
+    </AuthProvider>
+  );
+}
+
+
